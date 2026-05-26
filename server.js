@@ -2,6 +2,7 @@ import express from "express";
 import dotenv from "dotenv";
 import axios from "axios";
 import OpenAI from "openai";
+import FormData from "form-data";
 
 dotenv.config();
 
@@ -115,6 +116,11 @@ app.post("/webhook", (req, res) => {
 });
 
 async function handleTelegramUpdate(update) {
+  if (update?.callback_query) {
+    await handleCallbackQuery(update.callback_query);
+    return;
+  }
+
   const message =
     update?.message || update?.edited_message || update?.channel_post;
 
@@ -140,6 +146,42 @@ async function handleTelegramUpdate(update) {
   }
 }
 
+async function handleCallbackQuery(callbackQuery) {
+  const data = callbackQuery?.data;
+  const chatId = callbackQuery?.message?.chat?.id;
+
+  // Always answer callback queries to remove Telegram's loading spinner.
+  if (callbackQuery?.id) {
+    await answerCallbackQuery(callbackQuery.id);
+  }
+
+  if (!chatId || !data) return;
+
+  if (data === "process_now") {
+    // Remove the inline keyboard (best-effort) so it can't be spam-clicked.
+    if (callbackQuery?.message?.message_id) {
+      await editMessageReplyMarkup(chatId, callbackQuery.message.message_id, {
+        inline_keyboard: [],
+      });
+    }
+
+    const state = userPhotos.get(chatId);
+    if (!state || !Array.isArray(state.fileIds) || state.fileIds.length === 0) {
+      await sendMessage(chatId, "Nothing to process right now. Send a photo.");
+      return;
+    }
+
+    if (state.timerId) {
+      clearTimeout(state.timerId);
+      state.timerId = null;
+    }
+    userPhotos.set(chatId, state);
+
+    await sendMessage(chatId, "Generating now...");
+    await generateAndSendFromState(chatId);
+  }
+}
+
 async function handleIncomingPhoto(chatId, photoSizes) {
   const state = userPhotos.get(chatId) || { fileIds: [], timerId: null };
 
@@ -152,7 +194,12 @@ async function handleIncomingPhoto(chatId, photoSizes) {
 
     await sendMessage(
       chatId,
-      "Photo received (1/2). Send a second photo within ~8 seconds for outfit+person, or wait to generate from 1 photo.",
+      "Photo received (1/2). Send a second photo within ~8 seconds for outfit+person, or tap Process now to generate from 1 photo.",
+      {
+        reply_markup: {
+          inline_keyboard: [[{ text: "Process now", callback_data: "process_now" }]],
+        },
+      },
     );
 
     state.timerId = setTimeout(() => {
@@ -189,6 +236,9 @@ async function generateAndSendFromState(chatId) {
     "Processing your photo(s)… please wait.",
   );
 
+  // Native Telegram UI indicator (dots) while we work.
+  const stopIndicator = startChatActionLoop(chatId, "upload_photo");
+
   try {
     const imageUrls = [];
     for (const fileId of state.fileIds.slice(0, 2)) {
@@ -205,6 +255,7 @@ async function generateAndSendFromState(chatId) {
     );
     throw error;
   } finally {
+    stopIndicator();
     if (processing?.message_id) {
       await deleteMessage(chatId, processing.message_id);
     }
@@ -220,30 +271,103 @@ async function getTelegramFileURL(fileId) {
 }
 
 async function generateOOTDImage(imageUrls) {
-  try {
-    const result = await openai.images.generate({
-      model: "gpt-image-1",
-      prompt: IMAGE_PROMPT,
-      size: "1024x1792",
-      image: imageUrls,
+  // The Images generations endpoint does not accept reference images.
+  // Use the Responses API image_generation tool, which supports input images.
+  const content = [{ type: "input_text", text: IMAGE_PROMPT }];
+
+  for (const url of imageUrls) {
+    content.push({
+      type: "input_image",
+      image_url: url,
     });
-
-    const imageBase64 = result.data[0].b64_json;
-
-    return `data:image/png;base64,${imageBase64}`;
-  } catch (error) {
-    console.error(error);
-    throw error;
   }
+
+  const response = await openai.responses.create({
+    model: process.env.OPENAI_TEXT_MODEL || "gpt-5.2",
+    input: [
+      {
+        role: "user",
+        content,
+      },
+    ],
+    tools: [
+      {
+        type: "image_generation",
+        size: "1024x1792",
+      },
+    ],
+  });
+
+  const imageCall = response.output?.find(
+    (o) => o.type === "image_generation_call" && o.result,
+  );
+
+  if (!imageCall?.result) {
+    throw new Error("Image generation returned no result.");
+  }
+
+  // Base64-encoded image bytes
+  return imageCall.result;
 }
 
-async function sendMessage(chatId, text) {
+async function sendMessage(chatId, text, options = {}) {
   const response = await axios.post(`${TELEGRAM_API}/sendMessage`, {
     chat_id: chatId,
     text,
+    ...options,
   });
 
   return response.data?.result;
+}
+
+async function answerCallbackQuery(callbackQueryId) {
+  try {
+    await axios.post(`${TELEGRAM_API}/answerCallbackQuery`, {
+      callback_query_id: callbackQueryId,
+    });
+  } catch (error) {
+    console.error(error.response?.data || error.message);
+  }
+}
+
+async function editMessageReplyMarkup(chatId, messageId, replyMarkup) {
+  try {
+    await axios.post(`${TELEGRAM_API}/editMessageReplyMarkup`, {
+      chat_id: chatId,
+      message_id: messageId,
+      reply_markup: replyMarkup,
+    });
+  } catch (error) {
+    console.error(error.response?.data || error.message);
+  }
+}
+
+async function sendChatAction(chatId, action) {
+  try {
+    await axios.post(`${TELEGRAM_API}/sendChatAction`, {
+      chat_id: chatId,
+      action,
+    });
+  } catch (error) {
+    console.error(error.response?.data || error.message);
+  }
+}
+
+function startChatActionLoop(chatId, action) {
+  let stopped = false;
+
+  // Fire once immediately so the user sees feedback quickly.
+  sendChatAction(chatId, action);
+
+  const intervalId = setInterval(() => {
+    if (stopped) return;
+    sendChatAction(chatId, action);
+  }, 4000);
+
+  return () => {
+    stopped = true;
+    clearInterval(intervalId);
+  };
 }
 
 async function deleteMessage(chatId, messageId) {
@@ -259,11 +383,33 @@ async function deleteMessage(chatId, messageId) {
 }
 
 async function sendPhoto(chatId, photoBase64) {
-  await axios.post(`${TELEGRAM_API}/sendPhoto`, {
-    chat_id: chatId,
-    photo: photoBase64,
-    caption: "Generated by OOTD AI Bot",
+  const base64 = extractBase64(photoBase64);
+  const imageBuffer = Buffer.from(base64, "base64");
+
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  form.append("caption", "Generated by OOTD AI Bot");
+  form.append("photo", imageBuffer, {
+    filename: "ootd.png",
+    contentType: "image/png",
   });
+
+  await axios.post(`${TELEGRAM_API}/sendPhoto`, form, {
+    headers: form.getHeaders(),
+    maxBodyLength: Infinity,
+  });
+}
+
+function extractBase64(value) {
+  if (typeof value !== "string") {
+    throw new Error("Expected base64 string");
+  }
+
+  // Accept both raw base64 and data URLs.
+  const dataUrlMatch = value.match(/^data:[^;]+;base64,(.+)$/);
+  if (dataUrlMatch) return dataUrlMatch[1];
+
+  return value;
 }
 
 app.listen(PORT, () => {
