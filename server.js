@@ -18,6 +18,7 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
+// chatId -> { fileIds: string[], timerId?: NodeJS.Timeout | null }
 const userPhotos = new Map();
 
 const IMAGE_PROMPT = `
@@ -104,62 +105,111 @@ app.get("/set-webhook", async (req, res) => {
   }
 });
 
-app.post("/webhook", async (req, res) => {
-  try {
-    const message = req.body.message;
+app.post("/webhook", (req, res) => {
+  // Telegram expects a fast 200 response. Do work asynchronously.
+  res.sendStatus(200);
 
-    if (!message) {
-      return res.sendStatus(200);
-    }
-
-    const chatId = message.chat.id;
-
-    if (message.text === "/start") {
-      await sendMessage(
-        chatId,
-        `Send:\n\n1 photo = subject only\n2 photos = outfit + subject\n\nPhoto Order:\n1st photo = outfit\n2nd photo = person`,
-      );
-
-      return res.sendStatus(200);
-    }
-
-    if (message.photo) {
-      const photos = userPhotos.get(chatId) || [];
-
-      const fileId = message.photo[message.photo.length - 1].file_id;
-
-      photos.push(fileId);
-      userPhotos.set(chatId, photos);
-
-      await sendMessage(chatId, `Photo received (${photos.length}/2)`);
-
-      if (photos.length === 2) {
-        await sendMessage(
-          chatId,
-          "Generating realistic Philippine OOTD image...",
-        );
-
-        const imageUrls = [];
-
-        for (const fileId of photos) {
-          const fileUrl = await getTelegramFileURL(fileId);
-          imageUrls.push(fileUrl);
-        }
-
-        const generatedImage = await generateOOTDImage(imageUrls);
-
-        await sendPhoto(chatId, generatedImage);
-
-        userPhotos.delete(chatId);
-      }
-    }
-
-    res.sendStatus(200);
-  } catch (error) {
+  handleTelegramUpdate(req.body).catch((error) => {
     console.error(error.response?.data || error.message);
-    res.sendStatus(500);
-  }
+  });
 });
+
+async function handleTelegramUpdate(update) {
+  const message =
+    update?.message || update?.edited_message || update?.channel_post;
+
+  if (!message) return;
+
+  const chatId = message.chat?.id;
+  if (!chatId) return;
+
+  const text = typeof message.text === "string" ? message.text.trim() : "";
+
+  // /start can arrive as '/start@BotName' or '/start foo'
+  if (text && /^\/start(\s|@|$)/i.test(text)) {
+    await sendMessage(
+      chatId,
+      `Send:\n\n1 photo = subject only\n2 photos = outfit + subject\n\nPhoto Order:\n1st photo = outfit\n2nd photo = person\n\nTip: If you only send 1 photo, I'll generate after a few seconds.`,
+    );
+    return;
+  }
+
+  if (message.photo) {
+    await handleIncomingPhoto(chatId, message.photo);
+    return;
+  }
+}
+
+async function handleIncomingPhoto(chatId, photoSizes) {
+  const state = userPhotos.get(chatId) || { fileIds: [], timerId: null };
+
+  const fileId = photoSizes[photoSizes.length - 1].file_id;
+  state.fileIds.push(fileId);
+
+  // If this is the first photo, start a short timer to allow a 2nd photo.
+  if (state.fileIds.length === 1) {
+    userPhotos.set(chatId, state);
+
+    await sendMessage(
+      chatId,
+      "Photo received (1/2). Send a second photo within ~8 seconds for outfit+person, or wait to generate from 1 photo.",
+    );
+
+    state.timerId = setTimeout(() => {
+      generateAndSendFromState(chatId).catch((error) => {
+        console.error(error.response?.data || error.message);
+      });
+    }, 8000);
+
+    return;
+  }
+
+  // If second photo arrives before timer fires, cancel timer and generate now.
+  if (state.timerId) {
+    clearTimeout(state.timerId);
+    state.timerId = null;
+  }
+
+  userPhotos.set(chatId, state);
+  await sendMessage(chatId, "Photo received (2/2). Generating now...");
+  await generateAndSendFromState(chatId);
+}
+
+async function generateAndSendFromState(chatId) {
+  const state = userPhotos.get(chatId);
+  if (!state || !Array.isArray(state.fileIds) || state.fileIds.length === 0) {
+    return;
+  }
+
+  // Prevent duplicate generation if both timer and second photo race.
+  userPhotos.delete(chatId);
+
+  const processing = await sendMessage(
+    chatId,
+    "Processing your photo(s)… please wait.",
+  );
+
+  try {
+    const imageUrls = [];
+    for (const fileId of state.fileIds.slice(0, 2)) {
+      const fileUrl = await getTelegramFileURL(fileId);
+      imageUrls.push(fileUrl);
+    }
+
+    const generatedImage = await generateOOTDImage(imageUrls);
+    await sendPhoto(chatId, generatedImage);
+  } catch (error) {
+    await sendMessage(
+      chatId,
+      "Sorry — something went wrong while generating the image. Try again in a bit.",
+    );
+    throw error;
+  } finally {
+    if (processing?.message_id) {
+      await deleteMessage(chatId, processing.message_id);
+    }
+  }
+}
 
 async function getTelegramFileURL(fileId) {
   const response = await axios.get(`${TELEGRAM_API}/getFile?file_id=${fileId}`);
@@ -188,10 +238,24 @@ async function generateOOTDImage(imageUrls) {
 }
 
 async function sendMessage(chatId, text) {
-  await axios.post(`${TELEGRAM_API}/sendMessage`, {
+  const response = await axios.post(`${TELEGRAM_API}/sendMessage`, {
     chat_id: chatId,
     text,
   });
+
+  return response.data?.result;
+}
+
+async function deleteMessage(chatId, messageId) {
+  try {
+    await axios.post(`${TELEGRAM_API}/deleteMessage`, {
+      chat_id: chatId,
+      message_id: messageId,
+    });
+  } catch (error) {
+    // Best-effort: deletion can fail for older messages or permissions.
+    console.error(error.response?.data || error.message);
+  }
 }
 
 async function sendPhoto(chatId, photoBase64) {
