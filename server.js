@@ -93,7 +93,15 @@ app.get("/", (req, res) => {
 
 app.get("/set-webhook", async (req, res) => {
   try {
-    const url = `${WEBHOOK_URL}/webhook`;
+    if (!WEBHOOK_URL) {
+      return res.status(400).json({
+        error:
+          "WEBHOOK_URL is not set. Example: https://telegram-ootd-bot.onrender.com",
+      });
+    }
+
+    const baseUrl = normalizeWebhookBaseUrl(WEBHOOK_URL);
+    const url = `${baseUrl}/webhook`;
 
     const response = await axios.get(`${TELEGRAM_API}/setWebhook?url=${url}`);
 
@@ -106,14 +114,24 @@ app.get("/set-webhook", async (req, res) => {
   }
 });
 
-app.post("/webhook", (req, res) => {
+function webhookHandler(req, res) {
   // Telegram expects a fast 200 response. Do work asynchronously.
   res.sendStatus(200);
 
   handleTelegramUpdate(req.body).catch((error) => {
     console.error(error.response?.data || error.message);
   });
-});
+}
+
+app.post("/webhook", webhookHandler);
+// Compatibility route if webhook was mistakenly set to '/webhook/webhook'
+app.post("/webhook/webhook", webhookHandler);
+
+function normalizeWebhookBaseUrl(input) {
+  const trimmed = String(input).trim();
+  const withoutTrailingSlash = trimmed.replace(/\/+$/, "");
+  return withoutTrailingSlash.replace(/\/webhook$/i, "");
+}
 
 async function handleTelegramUpdate(update) {
   if (update?.callback_query) {
@@ -249,9 +267,12 @@ async function generateAndSendFromState(chatId) {
     const generatedImage = await generateOOTDImage(imageUrls);
     await sendPhoto(chatId, generatedImage);
   } catch (error) {
+    const details = getErrorDetails(error);
+    console.error("Generation failed:", details);
+
     await sendMessage(
       chatId,
-      "Sorry — something went wrong while generating the image. Try again in a bit.",
+      `Sorry — something went wrong while generating the image.\n\n${details.userMessage}`,
     );
     throw error;
   } finally {
@@ -271,6 +292,12 @@ async function getTelegramFileURL(fileId) {
 }
 
 async function generateOOTDImage(imageUrls) {
+  if (!openai?.responses?.create) {
+    throw new Error(
+      "OpenAI SDK does not support Responses API. Upgrade the 'openai' package to v6+.",
+    );
+  }
+
   // The Images generations endpoint does not accept reference images.
   // Use the Responses API image_generation tool, which supports input images.
   const content = [{ type: "input_text", text: IMAGE_PROMPT }];
@@ -308,6 +335,41 @@ async function generateOOTDImage(imageUrls) {
 
   // Base64-encoded image bytes
   return imageCall.result;
+}
+
+function getErrorDetails(error) {
+  const requestId = error?.request_id || error?._request_id;
+  const status = error?.status || error?.response?.status;
+  const apiMessage =
+    error?.error?.message ||
+    error?.response?.data?.error?.message ||
+    error?.message ||
+    "Unknown error";
+
+  // Keep user-facing message short and actionable.
+  let userMessage = apiMessage;
+
+  if (String(apiMessage).toLowerCase().includes("organization verification")) {
+    userMessage =
+      "Your OpenAI org/project may need verification for GPT Image. Check your OpenAI dashboard verification settings.";
+  } else if (String(apiMessage).toLowerCase().includes("tool") && String(apiMessage).toLowerCase().includes("not")) {
+    userMessage =
+      "Your selected model may not support image generation tool. Try setting OPENAI_TEXT_MODEL to a GPT-5.x model that supports image_generation.";
+  }
+
+  const suffix = [
+    status ? `status=${status}` : null,
+    requestId ? `request_id=${requestId}` : null,
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  return {
+    status,
+    requestId,
+    apiMessage,
+    userMessage: suffix ? `${userMessage}\n${suffix}` : userMessage,
+  };
 }
 
 async function sendMessage(chatId, text, options = {}) {
